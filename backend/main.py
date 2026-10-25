@@ -1,65 +1,111 @@
 import os
-import asyncio
+import json
+import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from dotenv import load_dotenv
-from agent_engine import NegotiationState, PactPayNegotiator
 
 
 load_dotenv()
 
 
-app = FastAPI(title="PactPay A2A Engine")
+from agent_engine import PactPayNegotiator, NegotiationState
+from test_paypal import create_paypal_order
+
+
+app = FastAPI(title="PactPay API")
 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.get("/api/channel3/catalog")
+def get_channel3_catalog(q: str = ""):
+    try:
+        url = os.getenv("CHANNEL3_API_URL", "https://api.trychannel3.com/v1/search")
+        api_key = os.getenv("CHANNEL3_API_KEY", "OXS2tmKWm9aoT63PQw7W15ivLun65zDk4jSikZi4")
+        headers = {
+            "x-api-key": api_key,
+            "Content-Type": "application/json"
+        }
+        
+        # If the frontend passes a search query, use it. Otherwise, load a default mix.
+        search_terms = [q] if q.strip() else ["sneakers", "laptop", "watch", "bags", "shoes", "headphones", "notebooks", "clothing", "stationary"]
+        formatted_catalog = []
+        
+        for term in search_terms:
+            payload = {"query": term, "limit": 20} 
+            response = requests.post(url, headers=headers, json=payload, timeout=5)
+            
+            if response.status_code == 200:
+                data = response.json()
+                raw_products = data.get("products", [])
+                
+                for p in raw_products:
+                    first_offer = p.get("offers", [{}])[0]
+                    
+                    price_data = first_offer.get("price", 0.0)
+                    if isinstance(price_data, dict):
+                        price = float(price_data.get("value", price_data.get("amount", 0.0)))
+                    else:
+                        try:
+                            price = float(price_data)
+                        except (ValueError, TypeError):
+                            price = 0.0
+                            
+                    stock = 100 if first_offer.get("availability") == "InStock" else 0
+                    
+                    formatted_catalog.append({
+                        "id": p.get("id", "UNKNOWN"),
+                        "name": p.get("title", "Unnamed Product"),
+                        "price": round(price, 2),
+                        "stock": stock
+                    })
+                    
+        return formatted_catalog
+
+
+    except Exception as e:
+        print(f"Channel 3 API Error: {e}")
+        return []
+
+
 @app.websocket("/ws/negotiate")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
-        if not os.getenv("GEMINI_API_KEY"):
-            await websocket.send_json({"sender": "SYSTEM", "message": "Error: GEMINI_API_KEY is missing from .env"})
-            return
-
-
-        # 1. Receive the initial parameters sent by the Next.js frontend
-        initial_data = await websocket.receive_json()
-        budget = float(initial_data.get("budget", 6000.0))
+        data = await websocket.receive_text()
+        params = json.loads(data)
         
-        # 2. Initialize the Pydantic state exactly matching agent_engine.py
         state = NegotiationState(
-            item_name=initial_data.get("item", "Titan watch"),
-            quantity=int(initial_data.get("units", 100)),
-            buyer_max_budget=budget,
-            seller_base_price=budget * 1.2,
-            seller_min_price=budget * 0.8
+            item_name=params.get("item"),
+            quantity=params.get("units"),
+            buyer_max_budget=params.get("budget")
         )
         
-        # 3. Initialize the negotiator
         negotiator = PactPayNegotiator(state)
-        
-        # 4. Smart Execution: Automatically find and run your AI loop
-        if hasattr(negotiator, 'run'):
-            async for response in negotiator.run():
-                await websocket.send_json(response)
-        elif hasattr(negotiator, 'start'):
-            async for response in negotiator.start():
-                await websocket.send_json(response)
-        elif hasattr(negotiator, 'negotiate'):
-            async for response in negotiator.negotiate():
-                await websocket.send_json(response)
-        else:
-            await websocket.send_json({"sender": "SYSTEM", "message": "Backend Error: Could not find run(), start(), or negotiate() in PactPayNegotiator."})
+        async for log in negotiator.run():
+            await websocket.send_json(log)
             
     except WebSocketDisconnect:
-        print("Client disconnected gracefully")
+        pass
     except Exception as e:
-        await websocket.send_json({"sender": "SYSTEM", "message": f"Backend Error: {str(e)}"})
+        await websocket.send_json({"sender": "SYSTEM", "message": f"Error: {str(e)}", "status": "failed"})
+
+
+class OrderRequest(BaseModel):
+    item_name: str
+    quantity: int
+    final_price: float
+
+
+@app.post("/api/paypal/create-order")
+async def create_order(request: OrderRequest):
+    return create_paypal_order(request.item_name, request.quantity, request.final_price)
