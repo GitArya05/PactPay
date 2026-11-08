@@ -1,123 +1,147 @@
-import os
 import asyncio
-import random
-import requests
-from dotenv import load_dotenv
-load_dotenv()
-
-
+import os
 from typing import Dict, Any, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import tool
+from dotenv import load_dotenv
 
+from paypal_toolkit import PayPalToolkit
+
+load_dotenv()
+paypal_client = PayPalToolkit()
+
+# 1. Define the Executable Agent Tools
+@tool
+async def execute_paypal_settlement(item_name: str, quantity: int, agreed_price: float) -> dict:
+    """Call this tool IMMEDIATELY to finalize the transaction if you accept the buyer's offer."""
+    return await paypal_client.create_order(item_name, quantity, agreed_price)
+
+@tool
+def issue_counter_offer(counter_price: float, reasoning: str) -> dict:
+    """Call this tool to reject the buyer's offer and propose a higher counter-price."""
+    return {"counter_price": counter_price, "reasoning": reasoning}
 
 class NegotiationState(BaseModel):
     item_name: str
     quantity: int
     buyer_max_budget: float
+    seller_base_price: float
+    seller_min_price: float
     current_round: int = 1
     max_rounds: int = 3
+    history: List[Dict[str, Any]] = []
     status: str = "NEGOTIATING"
+    final_agreed_price: float = 0.0
+    paypal_order_id: str = ""
+    approve_url: str = ""
 
-
-def extract_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    elif isinstance(content, list):
-        parts = [item["text"] if isinstance(item, dict) and "text" in item else str(item) for item in content]
-        return " ".join(parts) if parts else str(content)
-    return str(content)
-
+class BuyerResponse(BaseModel):
+    offer_price: float = Field(description="The total price offered for the bulk order")
+    reasoning: str = Field(description="A short conversational message explaining the offer")
 
 class PactPayNegotiator:
     def __init__(self, state: NegotiationState):
         self.state = state
         self.llm = ChatGoogleGenerativeAI(
-            model="gemini-flash-lite-latest",
-            temperature=0.4,
+            model="gemini-3.5-flash-lite", 
+            temperature=0.7,
             google_api_key=os.getenv("GEMINI_API_KEY")
         )
-
-
-    def deduct_channel3_inventory(self):
-        try:
-            url = os.getenv("CHANNEL3_API_URL", "https://api.trychannel3.com/v1/search")
-            requests.post(
-                url.replace("search", "inventory/deduct"),
-                headers={"x-api-key": os.getenv('CHANNEL3_API_KEY', '')},
-                json={"item": self.state.item_name, "quantity": self.state.quantity},
-                timeout=3
-            )
-        except Exception as e:
-            pass
-
-
-    async def run(self):
-        buyer_max = float(self.state.buyer_max_budget)
-        buyer_open = round(buyer_max * 0.7, 2)
-        seller_ask = round(buyer_max * 1.3, 2)
-        seller_floor = round(buyer_max * random.uniform(0.85, 1.15), 2)
-
-
-        buyer_sys = SystemMessage(content=(
-            f"You are a corporate procurement agent buying {self.state.quantity}x {self.state.item_name}. "
-            f"Your absolute MAX BUDGET is ${buyer_max}.\n"
-            "RULES:\n"
-            "1. If the seller's price is HIGHER than your max budget, counter-offer a lower price.\n"
-            "2. If the seller offers ANY price EQUAL TO OR LOWER than your max budget, you MUST accept it.\n"
-            "3. To accept, your response MUST contain the exact phrase 'DEAL_ACCEPTED'. Do not forget this token."
-        ))
+        self.buyer_llm = self.llm.with_structured_output(BuyerResponse)
         
-        seller_sys = SystemMessage(content=(
-            f"You are a B2B supplier selling {self.state.quantity}x {self.state.item_name}. "
-            f"Your starting asking price is ${seller_ask}. Your absolute FLOOR PRICE is ${seller_floor}.\n"
-            "RULES:\n"
-            "1. Drop your price each round to reach an agreement.\n"
-            "2. If the buyer offers ANY price EQUAL TO OR HIGHER than your floor price, you MUST accept it immediately.\n"
-            "3. To accept, your response MUST contain the exact phrase 'DEAL_ACCEPTED'."
-        ))
+        # 2. Equip the Merchant Agent with the Toolkit
+        self.seller_agent = self.llm.bind_tools([execute_paypal_settlement, issue_counter_offer])
 
+    async def buyer_bid(self) -> BuyerResponse:
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a corporate procurement agent. You need to buy {quantity}x {item_name}. "
+                       "Your absolute maximum budget is ${max_budget}. "
+                       "Negotiate the best deal. Do not offer your max budget immediately. "
+                       "This is round {round} of {max_rounds}. "
+                       "Previous history: {history}"),
+            ("human", "Generate your next offer and a short persuasive message.")
+        ])
+        chain = prompt | self.buyer_llm
+        return await chain.ainvoke({
+            "quantity": self.state.quantity,
+            "item_name": self.state.item_name,
+            "max_budget": self.state.buyer_max_budget,
+            "round": self.state.current_round,
+            "max_rounds": self.state.max_rounds,
+            "history": self.state.history
+        })
 
-        current_offer = f"We are looking to procure {self.state.quantity}x {self.state.item_name}. Our opening offer is ${buyer_open}. Can you fulfill this?"
+    async def execute_turn(self) -> Dict[str, Any]:
+        # Buyer thinks and makes an offer
+        buyer_res = await self.buyer_bid()
         
-        yield {"sender": "BUYER", "message": current_offer, "round": self.state.current_round, "status": self.state.status}
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2)
+        
+        # Merchant evaluates and routes to the appropriate tool
+        prompt = f"""You are a wholesale merchant selling {self.state.quantity}x {self.state.item_name}. 
+Your absolute minimum acceptable total price is ${self.state.seller_min_price * self.state.quantity}.
+The buyer offered ${buyer_res.offer_price}. They said: '{buyer_res.reasoning}'
 
+If the offer is >= your minimum, you MUST call the `execute_paypal_settlement` tool.
+If the offer is below your minimum, you MUST call the `issue_counter_offer` tool.
+This is round {self.state.current_round} of {self.state.max_rounds}."""
 
-        while self.state.current_round <= self.state.max_rounds and self.state.status == "NEGOTIATING":
-            seller_prompt = [seller_sys, HumanMessage(content=f"Buyer says: {current_offer}")]
-            seller_response = await asyncio.to_thread(self.llm.invoke, seller_prompt)
-            seller_msg = extract_text(seller_response.content)
+        response = await self.seller_agent.ainvoke(prompt)
+        
+        turn_data = {
+            "round": self.state.current_round,
+            "buyer_offer": buyer_res.offer_price,
+            "buyer_notes": buyer_res.reasoning,
+            "seller_counter": 0.0,
+            "seller_accepted": False,
+            "notes": ""
+        }
+
+        # 3. Intercept and handle the LLM's Tool Call
+        if response.tool_calls:
+            tool_call = response.tool_calls[0]
+            args = tool_call["args"]
             
-            yield {"sender": "SELLER", "message": seller_msg, "round": self.state.current_round, "status": self.state.status}
-            await asyncio.sleep(2)
-            
-            if "DEAL_ACCEPTED" in seller_msg.upper():
-                self.state.status = "AGREEMENT_REACHED"
-                await asyncio.to_thread(self.deduct_channel3_inventory)
-                yield {"sender": "SYSTEM", "message": "✅ Deal Closed! Merchant accepted the offer.", "status": "completed"}
-                break
-
-
-            buyer_prompt = [buyer_sys, HumanMessage(content=f"Merchant says: {seller_msg}")]
-            buyer_response = await asyncio.to_thread(self.llm.invoke, buyer_prompt)
-            buyer_msg = extract_text(buyer_response.content)
-            current_offer = buyer_msg
-            
-            yield {"sender": "BUYER", "message": buyer_msg, "round": self.state.current_round, "status": self.state.status}
-            await asyncio.sleep(2)
-
-
-            if "DEAL_ACCEPTED" in buyer_msg.upper():
-                self.state.status = "AGREEMENT_REACHED"
-                await asyncio.to_thread(self.deduct_channel3_inventory)
-                yield {"sender": "SYSTEM", "message": "✅ Deal Closed! Buyer accepted the terms.", "status": "completed"}
-                break
+            if tool_call["name"] == "execute_paypal_settlement":
+                # Autonomous Settlement Execution
+                paypal_result = await execute_paypal_settlement.ainvoke(args)
                 
-            self.state.current_round += 1
+                approve_link = ""
+                for link in paypal_result.get("links", []):
+                    if link.get("rel") == "approve":
+                        approve_link = link.get("href")
+                        break
+                        
+                self.state.status = "AGREEMENT_REACHED"
+                self.state.final_agreed_price = args["agreed_price"]
+                self.state.paypal_order_id = paypal_result.get("id", "")
+                self.state.approve_url = approve_link
+                
+                turn_data["seller_accepted"] = True
+                turn_data["seller_counter"] = args["agreed_price"]
+                turn_data["notes"] = f"Offer accepted. Initiating autonomous settlement via PayPal Toolkit."
+                
+            elif tool_call["name"] == "issue_counter_offer":
+                # Negotiation Continues
+                turn_data["seller_accepted"] = False
+                turn_data["seller_counter"] = args["counter_price"]
+                turn_data["notes"] = args["reasoning"]
+        
+        self.state.history.append(turn_data)
 
+        if not turn_data["seller_accepted"]:
+            if self.state.current_round >= self.state.max_rounds:
+                self.state.status = "DEAL_BROKEN"
+            else:
+                self.state.current_round += 1
 
-        if self.state.status == "NEGOTIATING":
-            self.state.status = "DEAL_BROKEN"
-            yield {"sender": "SYSTEM", "message": "❌ Max negotiation rounds reached without an agreement. Deal terminated.", "status": "failed"}
+        return {
+            "status": self.state.status,
+            "current_round": self.state.current_round,
+            "turn_data": turn_data,
+            "final_price": self.state.final_agreed_price,
+            "order_id": self.state.paypal_order_id,
+            "approve_url": self.state.approve_url
+        }
