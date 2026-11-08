@@ -1,361 +1,395 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-'use client';
+"use client";
 
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { Bot, Play, Tag, Package, DollarSign, Search } from 'lucide-react';
-import { AgGridReact } from 'ag-grid-react';
-import { ModuleRegistry, ClientSideRowModelModule, RowSelectionModule } from 'ag-grid-community';
-import 'ag-grid-community/styles/ag-grid.css';
-import 'ag-grid-community/styles/ag-theme-alpine.css';
+import { useState, useRef, useEffect, useMemo } from "react";
+import { AgGridReact } from "ag-grid-react";
+import { motion, AnimatePresence } from "framer-motion";
+import "ag-grid-community/styles/ag-grid.css";
+import "ag-grid-community/styles/ag-theme-alpine.css";
+import { ArrowUpRight, Play, Check, Sparkles, Loader2 } from "lucide-react";
 
-ModuleRegistry.registerModules([ClientSideRowModelModule, RowSelectionModule]);
-
-interface Log {
-  sender: string;
-  message: any;
+type LogEntry = {
+  id: number;
+  sender: "SYSTEM" | "BUYER" | "SELLER";
+  cleanText: string;
+  price?: number;
+  accepted?: boolean;
   round?: number;
-  status?: string;
-}
-
-const renderMessage = (msg: any): string => {
-  if (typeof msg === 'string') return msg;
-  if (Array.isArray(msg)) return msg[0]?.text || JSON.stringify(msg);
-  if (typeof msg === 'object' && msg !== null) return msg.text || JSON.stringify(msg);
-  return String(msg);
 };
 
 export default function Home() {
-  const [logs, setLogs] = useState<Log[]>([]);
-  const [item, setItem] = useState('');
-  const [units, setUnits] = useState(100);
-  const [budget, setBudget] = useState(6000);
+  const [itemName, setItemName] = useState("Macbook Air M1");
+  const [quantity, setQuantity] = useState<number>(100);
+  const [budget, setBudget] = useState<number>(2000);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [rowData, setRowData] = useState<any[]>([]);
   const [isNegotiating, setIsNegotiating] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState('Disconnected');
-  const [dealAgreed, setDealAgreed] = useState(false);
 
-  // Search state
-  const [searchQuery, setSearchQuery] = useState('');
-  const [isSearching, setIsSearching] = useState(false);
+  const logCounter = useRef(0);
+  const feedScrollRef = useRef<HTMLDivElement>(null);
 
-  const [catalogData, setCatalogData] = useState<any[]>([]);
-  const [catalogColDefs] = useState([
-    { field: 'id', headerName: 'Product ID', flex: 1 },
-    { field: 'name', headerName: 'Item Name', flex: 2 },
-    { field: 'price', headerName: 'Base Price', flex: 1, valueFormatter: (p: any) => `$${p.value}` },
-    { field: 'stock', headerName: 'Available Units', flex: 1 },
-  ]);
-
-  const [historyData, setHistoryData] = useState<any[]>([]);
-  const [historyColDefs] = useState([
-    { field: 'id', headerName: 'Agreement ID', flex: 1 },
-    { field: 'name', headerName: 'Negotiated Item', flex: 2 },
-    { field: 'price', headerName: 'Final Per-Unit Price', flex: 1, valueFormatter: (p: any) => `$${p.value}` },
-    { field: 'stock', headerName: 'Units Secured', flex: 1 },
-  ]);
-
-  const wsRef = useRef<WebSocket | null>(null);
-  const buyerEndRef = useRef<HTMLDivElement>(null);
-  const sellerEndRef = useRef<HTMLDivElement>(null);
-
-  const fetchCatalog = useCallback(async (query = '') => {
-    setIsSearching(true);
-    try {
-      const response = await fetch(
-        `http://127.0.0.1:8000/api/channel3/catalog?q=${encodeURIComponent(query)}`
-      );
-      if (response.ok) {
-        const data = await response.json();
-        setCatalogData(data);
-      }
-    } catch (err) {
-      console.error('Failed to fetch catalog:', err);
-    } finally {
-      setIsSearching(false);
+  useEffect(() => {
+    if (feedScrollRef.current) {
+      feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight;
     }
-  }, []);
-
-  useEffect(() => {
-    const loadInitialCatalog = async () => {
-      // Awaiting first means setState isn't called synchronously in the effect body
-      await Promise.resolve();
-      fetchCatalog(); // Fetch default mix on initial load
-    };
-    loadInitialCatalog();
-  }, [fetchCatalog]);
-
-  useEffect(() => {
-    const loadHistory = async () => {
-      // Awaiting first means setState isn't called synchronously in the effect body
-      await Promise.resolve();
-      const savedHistory = localStorage.getItem('pactpay_deals');
-      if (!savedHistory) return;
-      try {
-        const parsed = JSON.parse(savedHistory);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setHistoryData(parsed);
-          setDealAgreed(true);
-        }
-      } catch {
-        console.error('Could not parse history');
-      }
-    };
-    loadHistory();
-  }, []);
-
-  useEffect(() => {
-    buyerEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-    sellerEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  const dispatchAgents = () => {
-    if (!item.trim()) {
-      alert('Please select an item from the catalog first.');
-      return;
-    }
+  const parseAgentMessage = (raw: string) => {
+    const priceMatch = raw.match(/\$([0-9]+(?:\.[0-9]+)?)/);
+    const price = priceMatch ? parseFloat(priceMatch[1]) : undefined;
+    const parts = raw.split(" — ");
+    const cleanText = parts.length > 1 ? parts.slice(1).join(" — ") : raw;
+    return { price, cleanText };
+  };
 
+  const startNegotiation = () => {
+    if (!itemName || quantity <= 0 || budget <= 0) return;
     setIsNegotiating(true);
-    setLogs([{ sender: 'SYSTEM', message: `Starting A2A negotiation for ${units}x ${item}...` }]);
+    setLogs([]);
+    logCounter.current = 0;
 
-    const ws = new WebSocket('ws://127.0.0.1:8000/ws/negotiate');
-    wsRef.current = ws;
+    const wsUrl = process.env.NEXT_PUBLIC_BACKEND_WS_URL || "ws://localhost:8000/ws/negotiate";
+    const ws = new WebSocket(wsUrl);
+
 
     ws.onopen = () => {
-      setConnectionStatus('Connected');
-      ws.send(JSON.stringify({ item, units, budget }));
+      ws.send(
+        JSON.stringify({
+          item_name: itemName,
+          quantity: quantity,
+          buyer_max_budget: budget,
+        })
+      );
     };
 
     ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        setLogs((prev) => [...prev, data]);
+      const data = JSON.parse(event.data);
+      logCounter.current += 1;
+      const currentId = logCounter.current;
 
-        if (data.status === 'completed' || data.status === 'failed') {
+      if (data.type === "SYSTEM") {
+        if (data.message.includes("without mutual agreement")) {
           setIsNegotiating(false);
-          ws.close();
-          if (renderMessage(data.message).includes('✅ Deal Closed!')) {
-            setDealAgreed(true);
-            const calculatedPrice = (budget / units).toFixed(2);
-            const newDeal = {
-              id: `PACT-${Date.now().toString().slice(-4)}`,
-              name: item,
-              price: calculatedPrice,
-              stock: units,
-            };
-            setHistoryData((prev) => {
-              const updated = [newDeal, ...prev];
-              localStorage.setItem('pactpay_deals', JSON.stringify(updated));
-              return updated;
-            });
-          }
         }
-      } catch {
-        setLogs((prev) => [...prev, { sender: 'SYSTEM', message: 'Error parsing message' }]);
+        setLogs((prev) => [
+          ...prev,
+          { id: currentId, sender: "SYSTEM", cleanText: data.message },
+        ]);
+      } else if (data.type === "BUYER_AGENT") {
+        const { price, cleanText } = parseAgentMessage(data.message);
+        setLogs((prev) => [
+          ...prev,
+          {
+            id: currentId,
+            sender: "BUYER",
+            cleanText,
+            price,
+            round: data.round,
+          },
+        ]);
+      } else if (data.type === "SELLER_AGENT") {
+        const { price, cleanText } = parseAgentMessage(data.message);
+        setLogs((prev) => [
+          ...prev,
+          {
+            id: currentId,
+            sender: "SELLER",
+            cleanText,
+            price,
+            accepted: data.accepted,
+            round: data.round,
+          },
+        ]);
+      } else if (data.type === "SETTLEMENT_COMPLETE") {
+        setIsNegotiating(false);
+        setLogs((prev) => [
+          ...prev,
+          {
+            id: currentId + 1,
+            sender: "SYSTEM",
+            cleanText: "Order settled via PayPal Sandbox.",
+          },
+        ]);
+
+        setRowData((prev) => [
+          {
+            order_id: data.paypal_order_id,
+            status: data.status,
+            item: `${data.quantity} × ${data.item_name}`,
+            price: `$${data.final_price.toFixed(2)}`,
+            approve_url: data.approve_url,
+          },
+          ...prev,
+        ]);
       }
     };
 
-    ws.onerror = () => {
-      setLogs((prev) => [...prev, { sender: 'SYSTEM', message: 'Connection error. Is Python backend running?' }]);
-      setIsNegotiating(false);
-    };
-
-    ws.onclose = () => {
-      setConnectionStatus('Disconnected');
-      setIsNegotiating(false);
-    };
+    ws.onclose = () => setIsNegotiating(false);
   };
 
-  const handlePayPalCheckout = async () => {
-    try {
-      const response = await fetch('http://127.0.0.1:8000/api/paypal/create-order', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ item_name: item, quantity: units, final_price: budget }),
-      });
-      const data = await response.json();
-      if (data.approval_url) {
-        window.location.href = data.approval_url;
-      }
-    } catch {
-      alert('Failed to reach backend PayPal route.');
-    }
-  };
+  const colDefs = useMemo(
+    () => [
+      {
+        field: "order_id",
+        headerName: "Order ID",
+        flex: 1.5,
+        cellClass: "font-mono text-zinc-300",
+      },
+      {
+        field: "item",
+        headerName: "Procured Item",
+        flex: 2.5,
+        cellClass: "text-zinc-200 font-medium",
+      },
+      {
+        field: "price",
+        headerName: "Total Settled",
+        flex: 1,
+        cellClass: "font-mono font-semibold text-amber-400",
+      },
+      {
+        field: "status",
+        headerName: "Status",
+        flex: 1,
+        cellRenderer: (params: any) => (
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">
+            <Check size={14} /> {params.value}
+          </span>
+        ),
+      },
+      {
+        field: "approve_url",
+        headerName: "Checkout",
+        flex: 1.2,
+        cellRenderer: (params: any) =>
+          params.value ? (
+            <a
+              href={params.value}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs font-semibold text-amber-400 hover:text-amber-300 transition-colors"
+            >
+              Open PayPal <ArrowUpRight size={14} />
+            </a>
+          ) : (
+            <span className="text-zinc-600">—</span>
+          ),
+      },
+    ],
+    []
+  );
 
   return (
-    <div className="min-h-screen bg-slate-50 p-8 font-sans text-slate-900">
-      <div className="max-w-6xl mx-auto space-y-6">
-        <header className="flex items-center justify-between bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-          <div>
-            <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
-              PactPay <span className="text-blue-600">A2A</span>
+    <main className="min-h-screen bg-[#09090B] text-zinc-100 py-10 px-6 font-sans antialiased selection:bg-amber-500/20">
+      <div className="max-w-4xl mx-auto space-y-8">
+
+        {/* Minimal Header */}
+        <header className="flex justify-between items-center">
+          <div className="flex items-center gap-3">
+            <div className="w-2.5 h-2.5 rounded-full bg-amber-500" />
+            <h1 className="text-xl font-semibold tracking-tight text-zinc-100">
+              PactPay
             </h1>
-            <p className="text-sm text-slate-500 mt-1">Autonomous B2B Procurement Protocol</p>
+            <span className="text-zinc-600">/</span>
+            <span className="text-sm text-zinc-400">Autonomous B2B Procurement</span>
           </div>
-          <div className="flex items-center gap-2 bg-emerald-50 text-emerald-700 px-4 py-2 rounded-full text-sm font-semibold border border-emerald-200">
-            <div
-              className={`w-2 h-2 rounded-full ${
-                connectionStatus === 'Connected' ? 'bg-emerald-500' : 'bg-slate-400'
-              }`}
-            />
-            {connectionStatus === 'Connected' ? 'System Connected' : 'Ready'}
+
+          <div className="flex items-center gap-2 text-xs text-zinc-400 bg-zinc-900 border border-zinc-800 px-3 py-1.5 rounded-full">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+            PayPal Sandbox
           </div>
         </header>
 
-        <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-          <div className="flex justify-between items-center mb-4">
-            <h2 className="text-sm font-bold text-slate-800 flex items-center gap-2">
-              <Package size={16} className="text-blue-600" /> Channel 3 Live Catalog
-            </h2>
-            <div className="flex gap-2">
+        {/* Clean Control Bar */}
+        <section className="bg-[#121215] border border-zinc-800/80 rounded-2xl p-5 shadow-sm">
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-end">
+            <div className="md:col-span-5 space-y-1.5">
+              <label className="text-xs font-medium text-zinc-400">Product</label>
               <input
                 type="text"
-                placeholder="Search catalog (e.g., drone, jacket)"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && fetchCatalog(searchQuery)}
-                className="px-3 py-2 text-sm bg-slate-50 border border-slate-200 rounded-lg outline-none focus:border-blue-500 w-64 transition-colors"
+                value={itemName}
+                onChange={(e) => setItemName(e.target.value)}
+                placeholder="e.g. keyboard, bottle, hoodie"
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 focus:border-amber-500/60 outline-none transition-colors"
               />
+            </div>
+
+            <div className="md:col-span-2 space-y-1.5">
+              <label className="text-xs font-medium text-zinc-400">Units</label>
+              <input
+                type="number"
+                value={quantity || ""}
+                onChange={(e) => setQuantity(parseInt(e.target.value, 10) || 0)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 font-mono focus:border-amber-500/60 outline-none transition-colors"
+              />
+            </div>
+
+            <div className="md:col-span-2 space-y-1.5">
+              <label className="text-xs font-medium text-zinc-400">Budget ($)</label>
+              <input
+                type="number"
+                value={budget || ""}
+                onChange={(e) => setBudget(parseInt(e.target.value, 10) || 0)}
+                className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-3.5 py-2.5 text-sm text-zinc-100 font-mono focus:border-amber-500/60 outline-none transition-colors"
+              />
+            </div>
+
+            <div className="md:col-span-3">
               <button
-                onClick={() => fetchCatalog(searchQuery)}
-                disabled={isSearching}
-                className="bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors flex items-center gap-2"
+                onClick={startNegotiation}
+                disabled={isNegotiating}
+                className="w-full h-[42px] bg-amber-500 hover:bg-amber-400 active:scale-[0.99] text-zinc-950 font-semibold text-sm rounded-xl flex items-center justify-center gap-2 transition-all disabled:opacity-50 cursor-pointer"
               >
-                <Search size={14} />
-                {isSearching ? '...' : 'Search'}
+                {isNegotiating ? (
+                  <>
+                    <Loader2 size={15} className="animate-spin" /> Negotiating
+                  </>
+                ) : (
+                  <>
+                    <Play size={14} fill="currentColor" /> Dispatch
+                  </>
+                )}
               </button>
             </div>
           </div>
-          <div className="ag-theme-alpine w-full h-[200px]">
-            <AgGridReact
-              theme="legacy"
-              rowData={catalogData}
-              columnDefs={catalogColDefs}
-              rowSelection={{ mode: 'singleRow' }}
-              onRowSelected={(e) => {
-                if (e.node.isSelected()) {
-                  setItem(e.data.name);
-                  setBudget(e.data.price * units);
-                }
-              }}
-            />
-          </div>
         </section>
 
-        <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 grid grid-cols-1 md:grid-cols-4 gap-4 items-end">
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-              <Tag size={14} /> Item Description
-            </label>
-            <input
-              type="text"
-              value={item}
-              placeholder="Select from catalog above..."
-              onChange={(e) => setItem(e.target.value)}
-              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
-            />
+        {/* Uncluttered Negotiation Stream */}
+        <section className="bg-[#121215] border border-zinc-800/80 rounded-2xl overflow-hidden">
+          <div className="px-6 py-3.5 border-b border-zinc-800/80 flex justify-between items-center">
+            <span className="text-xs font-medium text-zinc-400">Live Negotiation</span>
+            <div className="flex items-center gap-5 text-xs text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-amber-400" /> Buyer
+              </span>
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-zinc-400" /> Supplier
+              </span>
+            </div>
           </div>
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-              <Package size={14} /> Units Required
-            </label>
-            <input
-              type="number"
-              value={units}
-              onChange={(e) => {
-                const newUnits = Number(e.target.value);
-                setUnits(newUnits);
-                const selectedRow = catalogData.find((row) => row.name === item);
-                if (selectedRow) setBudget(selectedRow.price * newUnits);
-              }}
-              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider flex items-center gap-1">
-              <DollarSign size={14} /> Max Budget (USD)
-            </label>
-            <input
-              type="number"
-              value={budget}
-              onChange={(e) => setBudget(Number(e.target.value))}
-              className="w-full p-3 bg-slate-50 border border-slate-200 rounded-xl outline-none"
-            />
-          </div>
-          <button
-            onClick={dispatchAgents}
-            disabled={isNegotiating}
-            className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-slate-400 text-white p-3 rounded-xl font-bold flex items-center justify-center gap-2 h-[50px]"
+
+          <div
+            ref={feedScrollRef}
+            className="p-6 h-[380px] overflow-y-auto space-y-4 scroll-smooth custom-scrollbar"
           >
-            <Play size={18} />
-            {isNegotiating ? 'Negotiating...' : 'Dispatch Agents'}
-          </button>
-        </section>
+            <AnimatePresence initial={false}>
+              {logs.length === 0 && !isNegotiating && (
+                <div className="h-full flex items-center justify-center text-sm text-zinc-600">
+                  Ready to dispatch procurement agents.
+                </div>
+              )}
 
-        <section className="grid grid-cols-1 md:grid-cols-2 gap-6 h-[500px]">
-          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden flex flex-col shadow-sm">
-            <div className="bg-slate-900 text-white p-4 text-sm font-semibold flex items-center gap-2">
-              <Bot size={18} className="text-blue-400" /> Buyer Agent
-            </div>
-            <div className="p-4 flex-1 overflow-y-auto space-y-3 bg-slate-50/50">
-              {logs
-                .filter((l) => l.sender === 'BUYER' || l.sender === 'SYSTEM')
-                .map((log, i) => (
-                  <div
-                    key={i}
-                    className={`p-3 rounded-xl text-sm ${
-                      log.sender === 'SYSTEM'
-                        ? 'bg-slate-200 text-slate-700 font-medium text-center text-xs'
-                        : 'bg-blue-50 border border-blue-200 text-blue-900'
-                    }`}
+              {logs.map((log) => {
+                if (log.sender === "SYSTEM") {
+                  return (
+                    <motion.div
+                      key={log.id}
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      transition={{ duration: 0.2 }}
+                      className="flex justify-center py-1"
+                    >
+                      <span className="inline-flex items-center gap-1.5 text-xs text-zinc-500 bg-zinc-900/80 border border-zinc-800/60 px-3 py-1 rounded-full">
+                        <Sparkles size={11} className="text-amber-500" />
+                        {log.cleanText}
+                      </span>
+                    </motion.div>
+                  );
+                }
+
+                const isBuyer = log.sender === "BUYER";
+
+                return (
+                  <motion.div
+                    key={log.id}
+                    initial={{ opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.22, ease: "easeOut" }}
+                    className={`flex ${isBuyer ? "justify-start" : "justify-end"}`}
                   >
-                    {log.round && <div className="text-xs font-bold text-blue-700 mb-1">Round {log.round}:</div>}
-                    {renderMessage(log.message)}
-                  </div>
-                ))}
-              <div ref={buyerEndRef} />
-            </div>
-          </div>
+                    <div
+                      className={`max-w-[78%] rounded-2xl px-5 py-4 border ${isBuyer
+                        ? "bg-amber-500/[0.06] border-amber-500/20"
+                        : log.accepted
+                          ? "bg-emerald-500/[0.06] border-emerald-500/25"
+                          : "bg-zinc-900/90 border-zinc-800"
+                        }`}
+                    >
+                      <div className="flex items-center justify-between gap-4 mb-1.5">
+                        <span
+                          className={`text-xs font-semibold ${isBuyer
+                            ? "text-amber-400"
+                            : log.accepted
+                              ? "text-emerald-400"
+                              : "text-zinc-300"
+                            }`}
+                        >
+                          {isBuyer ? "Buyer Agent" : "Supplier Agent"}
+                          {log.round ? ` · Round ${log.round}` : ""}
+                        </span>
 
-          <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden flex flex-col shadow-sm">
-            <div className="bg-slate-900 text-white p-4 text-sm font-semibold flex items-center gap-2">
-              <Bot size={18} className="text-emerald-400" /> Merchant Agent
-            </div>
-            <div className="p-4 flex-1 overflow-y-auto space-y-3 bg-slate-50/50">
-              {logs
-                .filter((l) => l.sender === 'SELLER')
-                .map((log, i) => (
-                  <div key={i} className="p-3 rounded-xl text-sm bg-emerald-50 border border-emerald-200 text-emerald-900">
-                    {log.round && <div className="text-xs font-bold text-emerald-700 mb-1">Round {log.round}:</div>}
-                    {renderMessage(log.message)}
-                  </div>
-                ))}
-              <div ref={sellerEndRef} />
-            </div>
+                        {log.price !== undefined && (
+                          <span className="font-mono text-xs font-semibold text-zinc-100 bg-zinc-950/80 border border-zinc-800 px-2.5 py-0.5 rounded-md">
+                            ${log.price.toFixed(2)}
+                          </span>
+                        )}
+                      </div>
+
+                      <p className="text-sm text-zinc-300 leading-relaxed">
+                        {log.cleanText}
+                      </p>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </AnimatePresence>
           </div>
         </section>
 
-        {dealAgreed && (
-          <div className="space-y-6">
-            <section className="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
-              <h2 className="text-sm font-bold text-slate-800 mb-4 flex items-center gap-2">
-                <Package size={16} className="text-blue-600" /> Deal History
-              </h2>
-              <div className="ag-theme-alpine w-full h-[200px]">
-                <AgGridReact theme="legacy" rowData={historyData} columnDefs={historyColDefs} />
-              </div>
-            </section>
-            <div className="p-6 bg-emerald-50 border border-emerald-200 rounded-2xl flex flex-col items-center justify-center text-center shadow-sm">
-              <h3 className="text-xl font-bold text-emerald-900 mb-2">Agreement Reached</h3>
-              <p className="text-emerald-700 mb-6">Proceed to fund the PayPal Sandbox Escrow.</p>
-              <button
-                onClick={handlePayPalCheckout}
-                className="bg-[#003087] hover:bg-[#002266] text-white px-8 py-3 rounded-xl font-bold shadow-md"
-              >
-                Fund Escrow with PayPal
-              </button>
-            </div>
+        {/* Minimal Settlement Table */}
+        <section className="bg-[#121215] border border-zinc-800/80 rounded-2xl p-5 space-y-3">
+          <div className="flex justify-between items-center">
+            <h2 className="text-xs font-medium text-zinc-400">Settlements</h2>
+            <span className="text-xs text-zinc-500 font-mono">
+              {rowData.length} completed
+            </span>
           </div>
-        )}
+
+          <div className="ag-theme-alpine minimal-dark-grid w-full h-40 rounded-xl overflow-hidden border border-zinc-800/80">
+            <AgGridReact
+              rowData={rowData}
+              columnDefs={colDefs}
+              animateRows={true}
+              rowHeight={44}
+              headerHeight={38}
+            />
+          </div>
+        </section>
+
       </div>
-    </div>
+
+      <style
+        dangerouslySetInnerHTML={{
+          __html: `
+        .minimal-dark-grid.ag-theme-alpine {
+          --ag-background-color: #09090B !important;
+          --ag-header-background-color: #121215 !important;
+          --ag-odd-row-background-color: #0c0c0f !important;
+          --ag-row-hover-color: rgba(245, 158, 11, 0.05) !important;
+          --ag-border-color: #27272a !important;
+          --ag-header-foreground-color: #71717a !important;
+          --ag-foreground-color: #e4e4e7 !important;
+          --ag-font-family: inherit !important;
+          --ag-font-size: 13px !important;
+        }
+        .minimal-dark-grid .ag-root-wrapper {
+          border: none !important;
+        }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #27272a; border-radius: 9999px; }
+      `,
+        }}
+      />
+    </main>
   );
 }
