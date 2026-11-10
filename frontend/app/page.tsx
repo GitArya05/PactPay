@@ -252,7 +252,6 @@ export default function Home() {
             </div>
           </div>
         </section>
-
         {/* Uncluttered Negotiation Stream */}
         <section className="bg-[#121215] border border-zinc-800/80 rounded-2xl overflow-hidden">
           <div className="px-6 py-3.5 border-b border-zinc-800/80 flex justify-between items-center">
